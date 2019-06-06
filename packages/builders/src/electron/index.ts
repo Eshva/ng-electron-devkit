@@ -1,35 +1,127 @@
 import {
     BuilderContext,
-    BuilderConfiguration,
-    BuildEvent
-} from "@angular-devkit/architect";
-import {getSystemPath, join, normalize, Path, resolve, virtualFs} from '@angular-devkit/core';
-import {Observable, of} from "rxjs";
+    BuilderOutput,
+    createBuilder
+} from '@angular-devkit/architect';
+import {
+    getSystemPath,
+    join,
+    json,
+    normalize,
+    resolve,
+    Path
+} from '@angular-devkit/core';
+import { rimraf } from "rimraf";
+import { rmdir } from "rmdir";
+import treeKill from "tree-kill";
+import { ElectronBuilderSchema } from "./schema";
+import { Observable, of } from 'rxjs';
+import { compileElectronEntryPoint } from '../common/common';
+import { spawn, ChildProcess } from 'child_process';
+import { concatMap } from 'rxjs/operators';
 
-import {BrowserBuilder, NormalizedBrowserBuilderSchema} from "@angular-devkit/build-angular";
-import {ElectronBuilderSchema} from "./schema";
-import {runModuleAsObservableFork} from "@angular-devkit/build-angular/src/utils";
-import {concatMap} from 'rxjs/operators';
+export function build(
+    options: ElectronBuilderSchema,
+    context: BuilderContext) {
+    const electronBuilder = new ElectronBuilder(options, context);
+    return of(null).pipe(
+        concatMap(() => electronBuilder.compileElectronEntryPoint()),
+        concatMap(() => electronBuilder.installElectronApplicationDependencies())
+    )
+}
 
-import {BuildElectronArgs} from "./build-electron-args";
-import {buildWebpackConfig, compileElectronEntryPoint} from '../common/common';
+export default createBuilder<json.JsonObject & ElectronBuilderSchema>(build);
 
-import {ChildProcess,  spawn} from "child_process";
-import treeKill = require("tree-kill");
-import rimraf = require("rimraf");
-import {rmdir} from "fs";
+export class ElectronBuilder {
+    constructor(
+        private readonly options: ElectronBuilderSchema,
+        private readonly context: BuilderContext) {
+        this.root = normalize(this.context.workspaceRoot);
+    }
 
+    public compileElectronEntryPoint(): Observable<BuilderOutput> {
+        return compileElectronEntryPoint(this.options, this.context, this.options.outputPath)
+    }
 
+    public installElectronApplicationDependencies(): Observable<BuilderOutput> {
+        return new Observable<BuilderOutput>(output => {
+            const electronProjectPath: Path = resolve(this.root, normalize(this.options.electronProjectDir));
+            const electronNodeModulesPath = getSystemPath(resolve(electronProjectPath, normalize('node_modules')));
+            rimraf(electronNodeModulesPath, { rmdir: rmdir }, (error) => {
+                if (error) {
+                    this.context.logger.info(error.message);
+                    output.error(error);
+                    output.next({ success: false });
+                    output.complete();
+                }
+            });
+            let electronBuilderExecutable: string;
+            if (process.platform === 'win32') {
+                electronBuilderExecutable = 'electron-builder.cmd';
+            } else {
+                electronBuilderExecutable = 'electron-builder';
+            }
+            const electronBuilderExecutablePath: string = getSystemPath(join(this.root, 'node_modules', '.bin', electronBuilderExecutable));
+            const childProcess: ChildProcess = spawn(electronBuilderExecutablePath, ['install-app-deps'], { cwd: getSystemPath(electronProjectPath) });
+            const killForkedProcess = () => {
+                if (childProcess && childProcess.pid) {
+                    treeKill(childProcess.pid, 'SIGTERM');
+                }
+            };
+            // Handle child process exit.
+            const handleChildProcessExit = (code) => {
+                killForkedProcess();
+                if (code && code !== 0) {
+                    output.error();
+                }
+                output.next({ success: true });
+                output.complete();
+            };
+            childProcess.once('exit', handleChildProcessExit);
+            childProcess.once('SIGINT', handleChildProcessExit);
+            childProcess.once('uncaughtException', handleChildProcessExit);
+            const handleParentProcessExit = () => {
+                killForkedProcess();
+            };
+            process.once('exit', handleParentProcessExit);
+            process.once('SIGINT', handleParentProcessExit);
+            process.once('uncaughtException', handleParentProcessExit);
+        })
+    }
+    /*
+        public packElectronApplication(
+            options: ElectronBuilderSchema,
+            context: BuilderContext): Observable<BuilderOutput> {
+    
+            let args: BuildElectronArgs = {
+                projectDir: getSystemPath(resolve(root, normalize(options.electronProjectDir))),
+                platforms: options.electronPlatforms
+            };
+    
+            context.logger.info(
+                `Running electron-builder with projectDir: ${args.projectDir} and platforms: ${args.platforms}`
+            );
+    
+            return runModuleAsObservableFork(
+                getSystemPath(root),
+                '@ng-electron-devkit/builders/dist/electron/build-electron',
+                'build',
+                [
+                    args
+                ],
+            );
+        }
+    */
 
-
-export class ElectronBuilder extends BrowserBuilder {
-
+    private readonly root: Path;
+}
+/*
 
     constructor(public context: BuilderContext) {
         super(context);
     }
 
-    run(builderConfig: BuilderConfiguration<ElectronBuilderSchema>): Observable<BuildEvent> {
+    run(builderConfig: BuilderConfiguration<ElectronBuilderSchema>): Observable<BuilderOutput> {
         return of(null).pipe(
             concatMap(() => super.run(builderConfig)),
             concatMap(() => this.compileElectronEntryPoint(builderConfig)),
@@ -48,13 +140,13 @@ export class ElectronBuilder extends BrowserBuilder {
         return buildWebpackConfig(browserConfig);
     }
 
-    compileElectronEntryPoint(builderConfig: BuilderConfiguration<ElectronBuilderSchema>): Observable<BuildEvent> {
+    compileElectronEntryPoint(builderConfig: BuilderConfiguration<ElectronBuilderSchema>): Observable<BuilderOutput> {
         return compileElectronEntryPoint(this.context, builderConfig.options, builderConfig.options.outputPath)
     }
 
-    packElectronApplication(builderConfig: BuilderConfiguration<ElectronBuilderSchema>): Observable<BuildEvent> {
+    packElectronApplication(builderConfig: BuilderConfiguration<ElectronBuilderSchema>): Observable<BuilderOutput> {
 
-        const root = this.context.workspace.root;
+        const root = this.context.workspaceRoot;
 
         let args: BuildElectronArgs = {
             projectDir: getSystemPath(resolve(root, normalize(builderConfig.options.electronProjectDir))),
@@ -75,11 +167,11 @@ export class ElectronBuilder extends BrowserBuilder {
         );
     }
 
-    installElectronApplicationDependencies(builderConfig: BuilderConfiguration<ElectronBuilderSchema>): Observable<BuildEvent>{
+    installElectronApplicationDependencies(builderConfig: BuilderConfiguration<ElectronBuilderSchema>): Observable<BuilderOutput>{
 
 
-        return new Observable<BuildEvent>( obs =>{
-            const electronProjectPath : Path = resolve(this.context.workspace.root, normalize(builderConfig.options.electronProjectDir));
+        return new Observable<BuilderOutput>( obs =>{
+            const electronProjectPath : Path = resolve(root, normalize(builderConfig.options.electronProjectDir));
             const electronNodeModulesPath  = getSystemPath(resolve(  electronProjectPath ,normalize('node_modules')));
             rimraf(electronNodeModulesPath,{rmdir: rmdir}, (error)=>{
                 if(error){
@@ -95,7 +187,7 @@ export class ElectronBuilder extends BrowserBuilder {
             }else{
                 electronBuilderExecutable= 'electron-builder';
             }
-            const electronBuilderExecutablePath : string = getSystemPath(join(this.context.workspace.root, 'node_modules' , '.bin', electronBuilderExecutable));
+            const electronBuilderExecutablePath : string = getSystemPath(join(root, 'node_modules' , '.bin', electronBuilderExecutable));
             const childProcess: ChildProcess = spawn(electronBuilderExecutablePath , ['install-app-deps'] ,{cwd:getSystemPath(electronProjectPath)});
             const killForkedProcess = () => {
                 if (childProcess && childProcess.pid) {
@@ -127,3 +219,4 @@ export class ElectronBuilder extends BrowserBuilder {
 
 
 export default ElectronBuilder;
+*/
